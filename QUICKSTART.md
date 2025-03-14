@@ -14,7 +14,7 @@ This guide provides step-by-step instructions to get started with YOLOD11 for so
 2. **Install the dependencies**:
 
    ```bash
-   pip install torch torchvision tqdm matplotlib opencv-python pillow tensorboard pyyaml
+   pip install -r requirements.txt
    ```
 
 3. **Create the directory structure**:
