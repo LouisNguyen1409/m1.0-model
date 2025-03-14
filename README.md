@@ -32,7 +32,7 @@ cd yolod11
 2. Install the required dependencies:
 
 ```bash
-pip install torch torchvision tqdm matplotlib opencv-python pillow tensorboard pyyaml
+pip install -r requirements.txt
 ```
 
 ## Dataset Format
