@@ -166,29 +166,36 @@ class YOLOD11Loss(nn.Module):
             # Calculate box loss using CIoU
             if self.use_ciou and obj_mask.sum() > 0:
                 # Get predicted boxes where objectness=1
-                pred_boxes_pos = pred_boxes[obj_mask.bool()]
+                # Fix the shape mismatch by expanding the mask
+                expanded_mask = obj_mask.repeat(1, 1, 1, 1, 4)
+                pred_boxes_pos = pred_boxes[expanded_mask.bool()].view(-1, 4)
 
                 # Get target boxes
                 target_boxes_pos = torch.zeros_like(pred_boxes_pos)
 
                 # Get indices where obj_mask is 1
                 indices = obj_mask.nonzero(as_tuple=True)
-
+                
+                # We only need batch, anchor, height, width indices (first 4 elements of indices tuple)
+                # for indexing target_box, since target_box has shape [batch, anchor, h, w, 4]
+                batch_idx, anchor_idx, grid_y, grid_x = indices[0], indices[1], indices[2], indices[3]
+                
                 # Convert target box from tx, ty, tw, th to actual x, y, w, h
-                target_tx = target_box[..., 0][indices]
-                target_ty = target_box[..., 1][indices]
-                target_tw = target_box[..., 2][indices]
-                target_th = target_box[..., 3][indices]
+                target_tx = target_box[batch_idx, anchor_idx, grid_y, grid_x, 0]
+                target_ty = target_box[batch_idx, anchor_idx, grid_y, grid_x, 1]
+                target_tw = target_box[batch_idx, anchor_idx, grid_y, grid_x, 2]
+                target_th = target_box[batch_idx, anchor_idx, grid_y, grid_x, 3]
 
-                # Calculate grid positions
-                grid_x = indices[3].float()
-                grid_y = indices[2].float()
-
+                # Calculate grid positions (already have grid_x and grid_y from indices)
+                
+                # Make sure anchor_set is on the same device as the indices
+                anchor_set_device = anchor_set.to(device)
+                
                 # Convert to absolute coordinates
-                tx = (grid_x + target_tx) * stride
-                ty = (grid_y + target_ty) * stride
-                tw = torch.exp(target_tw) * anchor_set[indices[1], 0].to(device) * stride
-                th = torch.exp(target_th) * anchor_set[indices[1], 1].to(device) * stride
+                tx = (grid_x.float() + target_tx) * stride
+                ty = (grid_y.float() + target_ty) * stride
+                tw = torch.exp(target_tw) * anchor_set_device[anchor_idx, 0] * stride
+                th = torch.exp(target_th) * anchor_set_device[anchor_idx, 1] * stride
 
                 # Set target boxes as center format
                 target_boxes_pos[:, 0] = tx
@@ -203,10 +210,10 @@ class YOLOD11Loss(nn.Module):
                     x1y1x2y2=False,
                     CIoU=True
                 )
-                box_loss += ciou_loss.mean() * self.lambda_iou
+                loss_box += ciou_loss.mean() * self.lambda_iou
             else:
                 # Use MSE loss for box coordinates as fallback
-                box_loss += self.mse(
+                loss_box += self.mse(
                     pred_box[obj_mask.bool()],
                     target_box[obj_mask.bool()]
                 ).sum() * self.lambda_box
@@ -223,29 +230,32 @@ class YOLOD11Loss(nn.Module):
             ).sum()
 
             # Apply balance factor for this scale
-            obj_loss += (obj_loss_pos + 0.5 * obj_loss_neg) * self.lambda_obj * self.balance[scale_idx]
+            loss_obj += (obj_loss_pos + 0.5 * obj_loss_neg) * self.lambda_obj * self.balance[scale_idx]
 
             # Classification loss
             if obj_mask.sum() > 0:
-                cls_loss += self.bce(
-                    pred_cls[obj_mask.bool()],
-                    target_cls[obj_mask.bool()]
+                # Expand the mask to match the number of classes dimension
+                expanded_cls_mask = obj_mask.repeat(1, 1, 1, 1, self.num_classes)
+                
+                loss_cls += self.bce(
+                    pred_cls[expanded_cls_mask.bool()],
+                    target_cls[expanded_cls_mask.bool()]
                 ).sum() * self.lambda_cls
 
         # Normalize losses by batch size
-        box_loss /= batch_size
-        obj_loss /= batch_size
-        cls_loss /= batch_size
+        loss_box /= batch_size
+        loss_obj /= batch_size
+        loss_cls /= batch_size
 
         # Calculate total loss
-        total_loss = box_loss + obj_loss + cls_loss
+        total_loss = loss_box + loss_obj + loss_cls
 
         # Loss components dictionary
         loss_components = {
             'total': total_loss.item(),
-            'box': box_loss.item(),
-            'obj': obj_loss.item(),
-            'cls': cls_loss.item()
+            'box': loss_box.item(),
+            'obj': loss_obj.item(),
+            'cls': loss_cls.item()
         }
 
         return total_loss, loss_components

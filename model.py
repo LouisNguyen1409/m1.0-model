@@ -209,10 +209,10 @@ class YOLOD11Neck(nn.Module):
 
         # Bottom-up path (small to large)
         self.bottom_conv1 = ConvBNSiLU(256, 256, 3, stride=2, padding=1)
-        self.bottom_elan1 = ELANBlock(512, 512)  # 512 + 0 = 512
+        self.bottom_elan1 = ELANBlock(768, 512)  # 256 + 512 = 768 channels
 
         self.bottom_conv2 = ConvBNSiLU(512, 512, 3, stride=2, padding=1)
-        self.bottom_elan2 = ELANBlock(1024, 1024)  # 512 + 512 = 1024
+        self.bottom_elan2 = ELANBlock(1536, 1024)  # 512 + 1024 = 1536 channels
 
         # Output layers
         self.out_small = ELANBlock(256, 256)

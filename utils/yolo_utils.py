@@ -147,7 +147,10 @@ def process_predictions(predictions, anchors, strides, img_size, conf_thres=0.25
 
         # Get box coordinates and apply sigmoid to xy, exp to wh
         box_xy = (torch.sigmoid(pred[..., 0:2]) + grid) * stride  # center x, y
-        box_wh = torch.exp(pred[..., 2:4]) * anchor_set.unsqueeze(2).unsqueeze(3).to(device) * stride  # width, height
+        
+        # Fix the anchor reshaping to match the expected dimensions
+        anchors_reshaped = anchor_set.view(1, num_anchors, 1, 1, 2).to(device)
+        box_wh = torch.exp(pred[..., 2:4]) * anchors_reshaped * stride  # width, height
 
         # Convert to corner coordinates [x1, y1, x2, y2]
         box_x1y1 = box_xy - box_wh / 2

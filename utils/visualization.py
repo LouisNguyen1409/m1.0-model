@@ -183,10 +183,51 @@ def evaluate_detections(predictions, targets, iou_threshold=0.5, conf_threshold=
     Returns:
         metrics: dictionary with precision, recall, and mAP values
     """
+    # Determine device from first prediction tensor
+    device = predictions[0].device if predictions and len(predictions) > 0 else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
     num_classes = 0
     for target in targets:
-        if len(target['labels']) > 0:
-            num_classes = max(num_classes, target['labels'].max().item() + 1)
+        # Handle the case where target['labels'] could be either a tensor or a list
+        if isinstance(target['labels'], torch.Tensor):
+            # If it's a tensor, use max()
+            if target['labels'].numel() > 0:  # Check if tensor is not empty
+                num_classes = max(num_classes, target['labels'].max().item() + 1)
+        elif isinstance(target['labels'], list):
+            # If it's a list, use Python's max function
+            if target['labels']:  # Check if list is not empty
+                # Safely convert tensor elements to integers
+                max_label = 0
+                for l in target['labels']:
+                    if isinstance(l, torch.Tensor):
+                        if l.numel() == 1:  # Single element tensor
+                            max_label = max(max_label, l.item())
+                        else:  # Multi-element tensor
+                            if l.numel() > 0:
+                                max_label = max(max_label, l.max().item())
+                    else:
+                        try:
+                            max_label = max(max_label, int(l))
+                        except (TypeError, ValueError):
+                            print(f"Warning: Could not convert {l} of type {type(l)} to int")
+                
+                num_classes = max(num_classes, max_label + 1)
+        else:
+            # If it's something else, try to get a reasonable value
+            try:
+                if hasattr(target['labels'], 'max'):
+                    # If it has a max method, try to use it
+                    num_classes = max(num_classes, target['labels'].max().item() + 1)
+                else:
+                    # Otherwise try Python's built-in max
+                    num_classes = max(num_classes, max(target['labels']) + 1)
+            except:
+                print(f"Warning: Cannot determine max class from {type(target['labels'])}")
+    
+    # If we couldn't determine the number of classes, default to 1
+    if num_classes == 0:
+        print("Warning: Could not determine number of classes, defaulting to 1")
+        num_classes = 1
 
     # Initialize statistics
     true_positives = [[] for _ in range(num_classes)]
@@ -195,9 +236,29 @@ def evaluate_detections(predictions, targets, iou_threshold=0.5, conf_threshold=
 
     # Process each image
     for pred, target in zip(predictions, targets):
+        # Move target tensors to the same device as predictions
+        if isinstance(target['boxes'], torch.Tensor):
+            target['boxes'] = target['boxes'].to(device)
+        
+        if isinstance(target['labels'], torch.Tensor):
+            target['labels'] = target['labels'].to(device)
+            
         # Count ground truth objects for each class
         for label in target['labels']:
-            gt_count[label.item()] += 1
+            # Convert label to integer if it's a tensor
+            if isinstance(label, torch.Tensor):
+                if label.numel() == 1:
+                    label_idx = label.item()
+                else:
+                    # If tensor has multiple elements, we need to handle each one
+                    for i in range(label.numel()):
+                        label_idx = label[i].item()
+                        gt_count[label_idx] += 1
+                    continue  # Skip the final gt_count increment since we've already counted each
+            else:
+                label_idx = int(label)
+            
+            gt_count[label_idx] += 1
 
         # Filter predictions by confidence
         if pred.size(0) > 0:
@@ -213,7 +274,7 @@ def evaluate_detections(predictions, targets, iou_threshold=0.5, conf_threshold=
             pred = pred[mask]
 
         # Create detection status array (0 = not matched, 1 = matched)
-        gt_matched = torch.zeros(len(target['labels']), dtype=torch.bool)
+        gt_matched = torch.zeros(len(target['labels']), dtype=torch.bool, device=device)
 
         # Process detections
         for detection in pred:
@@ -221,16 +282,69 @@ def evaluate_detections(predictions, targets, iou_threshold=0.5, conf_threshold=
             cls_id = int(cls_id)
 
             # Skip if no ground truth in this image for this class
-            if cls_id not in target['labels']:
+            # Handle different types of target['labels']
+            labels_match = False
+            if isinstance(target['labels'], torch.Tensor):
+                # For tensor labels
+                if target['labels'].dim() == 1:  # 1D tensor
+                    labels_match = cls_id in target['labels']
+                else:  # Multi-dimensional tensor
+                    for i in range(target['labels'].size(0)):
+                        if cls_id == target['labels'][i].item():
+                            labels_match = True
+                            break
+            else:
+                # For list labels
+                for l in target['labels']:
+                    if isinstance(l, torch.Tensor):
+                        if l.numel() == 1 and l.item() == cls_id:
+                            labels_match = True
+                            break
+                        elif l.numel() > 1:
+                            for i in range(l.numel()):
+                                if l[i].item() == cls_id:
+                                    labels_match = True
+                                    break
+                    elif int(l) == cls_id:
+                        labels_match = True
+                        break
+                
+            if not labels_match:
                 false_positives[cls_id].append(1)
                 true_positives[cls_id].append(0)
                 continue
 
             # Get ground truth boxes for this class
-            gt_indices = (target['labels'] == cls_id).nonzero(as_tuple=True)[0]
+            # Handle different types of target['labels']
+            if isinstance(target['labels'], torch.Tensor):
+                if target['labels'].dim() == 1:  # 1D tensor
+                    gt_indices = (target['labels'] == cls_id).nonzero(as_tuple=True)[0]
+                else:  # Multi-dimensional tensor
+                    indices_list = []
+                    for i in range(target['labels'].size(0)):
+                        if target['labels'][i].item() == cls_id:
+                            indices_list.append(i)
+                    gt_indices = torch.tensor(indices_list, device=device)
+            else:
+                # For list labels
+                indices_list = []
+                for i, l in enumerate(target['labels']):
+                    if isinstance(l, torch.Tensor):
+                        if l.numel() == 1 and l.item() == cls_id:
+                            indices_list.append(i)
+                        elif l.numel() > 1:
+                            for j in range(l.numel()):
+                                if l[j].item() == cls_id:
+                                    indices_list.append(i)
+                                    break
+                    elif int(l) == cls_id:
+                        indices_list.append(i)
+                
+                # Convert to tensor (use same device as prediction)
+                gt_indices = torch.tensor(indices_list, device=device)
 
             # If all already matched, this is a false positive
-            if gt_matched[gt_indices].all():
+            if len(gt_indices) == 0 or gt_matched[gt_indices].all():
                 false_positives[cls_id].append(1)
                 true_positives[cls_id].append(0)
                 continue

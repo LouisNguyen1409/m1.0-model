@@ -43,6 +43,26 @@ def collate_fn(batch):
 
     images = torch.stack(images, 0)
 
+    # Convert list of dicts to dict of lists for train_one_epoch
+    if targets and isinstance(targets[0], dict):
+        # Initialize an empty dict to store batched targets
+        batched_targets = {}
+        # Get all keys from the first target dict
+        keys = targets[0].keys()
+        
+        # For each key, collect values from all targets
+        for key in keys:
+            if key == 'img_path':  # Handle non-tensor data differently
+                batched_targets[key] = [target[key] for target in targets]
+            else:
+                # Stack tensors if possible, otherwise store as list
+                try:
+                    batched_targets[key] = torch.stack([target[key] for target in targets])
+                except:
+                    batched_targets[key] = [target[key] for target in targets]
+        
+        return images, batched_targets
+    
     return images, targets
 
 
