@@ -76,7 +76,7 @@ yolod11/
    test: images/test
 
    nc: 7 # Number of classes
-   names: ['crack', 'delamination', 'disconnection', 'hotspot', 'soiling', 'corrosion', 'cell_defect']
+   names: ['a', 'b', 'c', 'd', 'e', 'f', 'g']
    ```
 
 ## Training the Model
