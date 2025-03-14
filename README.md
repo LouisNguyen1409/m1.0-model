@@ -1,6 +1,6 @@
-# YOLOD11: YOLO-based Object Detection for Solar Panel Inspection
+# M1.0-Model: YOLO-based Object Detection for Solar Panel Inspection
 
-YOLOD11 is a custom object detection model based on YOLO architecture with enhancements specifically designed for solar panel inspection tasks. The model includes several state-of-the-art techniques such as spatial and channel attention, complete IoU (CIoU) loss, and task-aligned predictors for improved detection performance.
+M1.0-Model is a custom object detection model based on YOLO architecture with enhancements specifically designed for solar panel inspection tasks. The model includes several state-of-the-art techniques such as spatial and channel attention, complete IoU (CIoU) loss, and task-aligned predictors for improved detection performance.
 
 ## Project Structure
 
@@ -25,8 +25,8 @@ m1.0-model/
 1. Clone this repository:
 
 ```bash
-git clone https://github.com/yourusername/.git](https://github.com/LouisNguyen1409/m1.0-model.git
-cd yolod11
+git clone https://github.com/LouisNguyen1409/m1.0-model.git
+cd m.10-model
 ```
 
 2. Install the required dependencies:
