@@ -1,14 +1,14 @@
-# YOLOD11 Quick Start Guide
+# M1.0-Model Quick Start Guide
 
-This guide provides step-by-step instructions to get started with YOLOD11 for solar panel inspection.
+This guide provides step-by-step instructions to get started with M1.0-Model for solar panel inspection.
 
 ## Setting Up Your Environment
 
 1. **Clone the repository**:
 
    ```bash
-   git clone https://github.com/yourusername/yolod11.git
-   cd yolod11
+   git clone https://github.com/LouisNguyen1409/m1.0-model.git
+   cd m1.0-model
    ```
 
 2. **Install the dependencies**:
@@ -17,21 +17,12 @@ This guide provides step-by-step instructions to get started with YOLOD11 for so
    pip install -r requirements.txt
    ```
 
-3. **Create the directory structure**:
-
-   ```bash
-   mkdir -p utils
-   touch utils/__init__.py
-   ```
-
-4. **Copy the code files to their respective locations** as shown in the [project structure](#project-structure).
-
 ## Project Structure
 
 Make sure your files are organized as follows:
 
 ```
-yolod11/
+m1.0-model/
 ├── model.py                 # YOLOD11 model architecture
 ├── datasets.py              # SolarPanelDataset class
 ├── train.py                 # Training script
