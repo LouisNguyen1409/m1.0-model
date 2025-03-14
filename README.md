@@ -73,7 +73,7 @@ val: images/val
 test: images/test
 
 nc: 7 # Number of classes
-names: ['crack', 'delamination', 'disconnection', 'hotspot', 'soiling', 'corrosion', 'cell_defect'] # Class names
+names: ['a', 'b', 'c', 'd', 'e', 'f', 'g'] # Class names
 ```
 
 ## Training
