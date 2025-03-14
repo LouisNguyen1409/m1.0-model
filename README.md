@@ -5,7 +5,7 @@ YOLOD11 is a custom object detection model based on YOLO architecture with enhan
 ## Project Structure
 
 ```
-yolod11/
+m1.0-model/
 ├── model.py                 # Contains the YOLOD11 model architecture
 ├── datasets.py              # Contains the SolarPanelDataset class
 ├── train.py                 # Main training script
@@ -25,7 +25,7 @@ yolod11/
 1. Clone this repository:
 
 ```bash
-git clone https://github.com/yourusername/yolod11.git
+git clone https://github.com/yourusername/.git](https://github.com/LouisNguyen1409/m1.0-model.git
 cd yolod11
 ```
 
