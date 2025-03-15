@@ -184,8 +184,9 @@ def evaluate_detections(predictions, targets, iou_threshold=0.5, conf_threshold=
         metrics: dictionary with precision, recall, and mAP values
     """
     # Determine device from first prediction tensor
-    device = predictions[0].device if predictions and len(predictions) > 0 else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
+    device = predictions[0].device if predictions and len(
+        predictions) > 0 else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
     num_classes = 0
     for target in targets:
         # Handle the case where target['labels'] could be either a tensor or a list
@@ -210,7 +211,7 @@ def evaluate_detections(predictions, targets, iou_threshold=0.5, conf_threshold=
                             max_label = max(max_label, int(l))
                         except (TypeError, ValueError):
                             print(f"Warning: Could not convert {l} of type {type(l)} to int")
-                
+
                 num_classes = max(num_classes, max_label + 1)
         else:
             # If it's something else, try to get a reasonable value
@@ -223,7 +224,7 @@ def evaluate_detections(predictions, targets, iou_threshold=0.5, conf_threshold=
                     num_classes = max(num_classes, max(target['labels']) + 1)
             except:
                 print(f"Warning: Cannot determine max class from {type(target['labels'])}")
-    
+
     # If we couldn't determine the number of classes, default to 1
     if num_classes == 0:
         print("Warning: Could not determine number of classes, defaulting to 1")
@@ -239,10 +240,10 @@ def evaluate_detections(predictions, targets, iou_threshold=0.5, conf_threshold=
         # Move target tensors to the same device as predictions
         if isinstance(target['boxes'], torch.Tensor):
             target['boxes'] = target['boxes'].to(device)
-        
+
         if isinstance(target['labels'], torch.Tensor):
             target['labels'] = target['labels'].to(device)
-            
+
         # Count ground truth objects for each class
         for label in target['labels']:
             # Convert label to integer if it's a tensor
@@ -257,7 +258,7 @@ def evaluate_detections(predictions, targets, iou_threshold=0.5, conf_threshold=
                     continue  # Skip the final gt_count increment since we've already counted each
             else:
                 label_idx = int(label)
-            
+
             gt_count[label_idx] += 1
 
         # Filter predictions by confidence
@@ -308,7 +309,7 @@ def evaluate_detections(predictions, targets, iou_threshold=0.5, conf_threshold=
                     elif int(l) == cls_id:
                         labels_match = True
                         break
-                
+
             if not labels_match:
                 false_positives[cls_id].append(1)
                 true_positives[cls_id].append(0)
@@ -339,19 +340,51 @@ def evaluate_detections(predictions, targets, iou_threshold=0.5, conf_threshold=
                                     break
                     elif int(l) == cls_id:
                         indices_list.append(i)
-                
+
                 # Convert to tensor (use same device as prediction)
                 gt_indices = torch.tensor(indices_list, device=device)
 
-            # If all already matched, this is a false positive
-            if len(gt_indices) == 0 or gt_matched[gt_indices].all():
+            # Get IoU with all ground truth boxes of this class
+            detection_box = detection[:4].unsqueeze(0)  # [1, 4]
+
+            # Fix the indexing issue - convert gt_indices to a list of integers for proper indexing
+            if gt_indices.numel() > 0:
+                # Make sure gt_indices is in the right format for indexing
+                if gt_indices.dim() > 1:
+                    gt_indices = gt_indices.view(-1)
+
+                # Check if all boxes are already matched before trying to index
+                all_matched = True
+                for idx in gt_indices:
+                    idx_val = idx.item() if isinstance(idx, torch.Tensor) else int(idx)
+                    if not gt_matched[idx_val]:
+                        all_matched = False
+                        break
+
+                if all_matched:
+                    # All ground truth boxes already matched, this is a false positive
+                    false_positives[cls_id].append(1)
+                    true_positives[cls_id].append(0)
+                    continue
+
+                # Convert to list of integers for indexing if needed
+                try:
+                    # Try direct indexing first
+                    gt_boxes = target['boxes'][gt_indices]
+                except (IndexError, TypeError):
+                    # If that fails, try converting indices to a list of integers
+                    indices_list = [idx.item() if isinstance(idx, torch.Tensor) else int(idx) for idx in gt_indices]
+                    gt_boxes = target['boxes'][indices_list]
+            else:
+                # No ground truth boxes for this class, skip
                 false_positives[cls_id].append(1)
                 true_positives[cls_id].append(0)
                 continue
 
-            # Get IoU with all ground truth boxes of this class
-            detection_box = detection[:4].unsqueeze(0)  # [1, 4]
-            gt_boxes = target['boxes'][gt_indices]  # [num_gt, 4]
+            # Make sure gt_boxes has the right shape
+            if gt_boxes.dim() == 1 and gt_boxes.shape[0] == 4:
+                # Single box with shape [4], reshape to [1, 4]
+                gt_boxes = gt_boxes.unsqueeze(0)
 
             ious = bbox_iou(detection_box, gt_boxes)
 
@@ -359,13 +392,23 @@ def evaluate_detections(predictions, targets, iou_threshold=0.5, conf_threshold=
             best_iou, best_idx = ious.max(1)
 
             # If IoU > threshold and not already matched, this is a true positive
-            if best_iou > iou_threshold and not gt_matched[gt_indices[best_idx]]:
-                true_positives[cls_id].append(1)
-                false_positives[cls_id].append(0)
-                gt_matched[gt_indices[best_idx]] = True
+            if best_iou > iou_threshold:
+                # Handle indexing properly
+                gt_idx = gt_indices[best_idx].item() if isinstance(
+                    gt_indices[best_idx], torch.Tensor) else int(gt_indices[best_idx])
+
+                if not gt_matched[gt_idx]:
+                    true_positives[cls_id].append(1)
+                    false_positives[cls_id].append(0)
+                    gt_matched[gt_idx] = True
+                else:
+                    # Already matched, this is a false positive
+                    false_positives[cls_id].append(1)
+                    true_positives[cls_id].append(0)
             else:
-                true_positives[cls_id].append(0)
+                # IoU below threshold, this is a false positive
                 false_positives[cls_id].append(1)
+                true_positives[cls_id].append(0)
 
     # Calculate metrics for each class
     precision = []
