@@ -233,36 +233,47 @@ def process_predictions(predictions, anchors, strides, img_size, conf_thres=0.25
             boxes = boxes[mask]
             scores = scores[mask]
             class_ids = class_ids[mask]
+            detections = detections[mask]
 
             if len(boxes) == 0:
                 output[batch_idx] = torch.zeros((0, 7), device=device)
                 continue
 
-        # Apply NMS
+        # Apply NMS with a more robust algorithm
         keep = []
-        while boxes.shape[0] > 0:
-            # Add highest confidence detection to keep
-            keep.append(0)
+        n = boxes.shape[0]
 
-            # If only one box left, we're done
-            if boxes.shape[0] == 1:
+        # Early exit if no boxes
+        if n == 0:
+            output[batch_idx] = torch.zeros((0, 7), device=device)
+            continue
+
+        # Create a mask to track which boxes are still active
+        active = torch.ones(n, dtype=torch.bool, device=device)
+
+        # Process boxes in order of confidence
+        for i in range(n):
+            # If this box has been suppressed already, skip it
+            if not active[i]:
+                continue
+
+            # Add this box to the keep list
+            keep.append(i)
+
+            # If this is the last box or all other boxes are suppressed, we're done
+            if i == n - 1 or not active[i+1:].any():
                 break
 
-            # Calculate IoU with other boxes
-            ious = bbox_iou(boxes[0].unsqueeze(0), boxes[1:])
-
-            # Find boxes with IoU < threshold
-            mask = ious < iou_thres
-
-            # Check if mask is empty (all boxes overlap with current box)
-            if not mask.any():
-                # If all remaining boxes overlap with the current one, just keep the current one and exit
+            # Get IoU of this box with all remaining active boxes
+            remaining_indices = torch.nonzero(active[i+1:]).squeeze(1) + i + 1
+            if len(remaining_indices) == 0:
                 break
 
-            # Update boxes, scores, and class_ids
-            boxes = torch.cat([boxes[0:1], boxes[1:][mask]])
-            scores = torch.cat([scores[0:1], scores[1:][mask]])
-            class_ids = torch.cat([class_ids[0:1], class_ids[1:][mask]])
+            ious = bbox_iou(boxes[i].unsqueeze(0), boxes[remaining_indices])
+
+            # Suppress boxes with IoU >= threshold
+            suppress = remaining_indices[ious >= iou_thres]
+            active[suppress] = False
 
         # Get kept detections
         keep_idx = torch.tensor(keep, device=device)
