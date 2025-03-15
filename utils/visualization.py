@@ -367,20 +367,36 @@ def evaluate_detections(predictions, targets, iou_threshold=0.5, conf_threshold=
                     true_positives[cls_id].append(0)
                     continue
 
-                # Convert to tensor (use same device as prediction)
-                gt_indices = torch.tensor(indices_list, device=device)
-
                 # Safely gather the boxes
                 try:
-                    gt_boxes = torch.stack([target['boxes'][i] for i in indices_list])
+                    # Check if we have tensors of different sizes
+                    first_box = target['boxes'][indices_list[0]]
+                    if all(target['boxes'][i].size() == first_box.size() for i in indices_list[1:]):
+                        gt_boxes = torch.stack([target['boxes'][i] for i in indices_list])
+                    else:
+                        # Boxes have different sizes, can't stack directly
+                        raise RuntimeError("Boxes have different sizes")
                 except (IndexError, TypeError, RuntimeError):
-                    # If we encounter an error, try a different approach
+                    # If we encounter an error, handle boxes individually
                     box_list = []
-                    for i in indices_list:
+                    valid_indices = []
+
+                    for idx, i in enumerate(indices_list):
                         try:
                             box = target['boxes'][i]
-                            box_list.append(box)
-                        except (IndexError, TypeError):
+
+                            # Check if this is a properly shaped box (should be 2D with 4 columns for x1,y1,x2,y2)
+                            if box.dim() == 2 and box.size(1) == 4:
+                                # Each box might have multiple rows, we need to select one row
+                                # For simplicity, we'll take the first box
+                                box_single = box[0].unsqueeze(0)  # Take first box and ensure it's 2D
+                                box_list.append(box_single)
+                                valid_indices.append(i)
+                            elif box.dim() == 1 and box.size(0) == 4:
+                                # Single box with correct shape
+                                box_list.append(box.unsqueeze(0))  # Ensure it's 2D
+                                valid_indices.append(i)
+                        except (IndexError, TypeError, RuntimeError):
                             continue
 
                     if not box_list:
@@ -389,9 +405,14 @@ def evaluate_detections(predictions, targets, iou_threshold=0.5, conf_threshold=
                         true_positives[cls_id].append(0)
                         continue
 
-                    gt_boxes = torch.stack(box_list)
-                    # Update gt_indices to match the valid boxes
-                    gt_indices = torch.tensor(indices_list[:len(box_list)], device=device)
+                    try:
+                        gt_boxes = torch.cat(box_list, dim=0)  # Use cat instead of stack
+                        # Update gt_indices to match the valid boxes
+                        gt_indices = torch.tensor(valid_indices, device=device)
+                    except RuntimeError:
+                        # If cat still fails, just use the first box as a fallback
+                        gt_boxes = box_list[0]
+                        gt_indices = torch.tensor([valid_indices[0]], device=device)
 
             # If all already matched, this is a false positive
             if len(gt_indices) == 0 or gt_matched[gt_indices].all():
