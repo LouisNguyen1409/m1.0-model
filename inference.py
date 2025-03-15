@@ -167,13 +167,6 @@ if __name__ == '__main__':
         'large': [(116, 90), (156, 198), (373, 326)]
     }
 
-    # Import your YOLOD11 model here. Adjust as needed.
-    try:
-        from yolod11 import YOLOD11
-    except ImportError:
-        print("YOLOD11 model not found. Please ensure it is defined in yolod11.py.")
-        sys.exit(1)
-
     model = YOLOD11(num_classes=num_classes).to(device)
     weights_path = "yolod11_final.pth"
     if not os.path.exists(weights_path):
