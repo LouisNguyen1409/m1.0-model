@@ -129,7 +129,7 @@ def inference_image(image_path, model, device, anchors_dict, num_classes, conf_t
 
     # Apply NMS
     keep = ops.nms(boxes_all, scores_all, iou_thresh)
-    boxes_all = boxes_all[keep].cpu().numpy().astype(np.int32)
+    boxes_all = boxes_all[keep].cpu().numpy()
     scores_all = scores_all[keep].cpu().numpy()
     classes_all = classes_all[keep].cpu().numpy()
 
@@ -138,6 +138,9 @@ def inference_image(image_path, model, device, anchors_dict, num_classes, conf_t
     scale_h = orig_h / 640
     boxes_all[:, [0, 2]] *= scale_w
     boxes_all[:, [1, 3]] *= scale_h
+
+    # Convert to int32 after scaling
+    boxes_all = boxes_all.astype(np.int32)
 
     # Draw detections
     for box, score, cls in zip(boxes_all, scores_all, classes_all):
