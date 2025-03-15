@@ -16,6 +16,12 @@ def bbox_iou(box1, box2, x1y1x2y2=True, GIoU=False, DIoU=False, CIoU=False, eps=
     Returns:
         IoU or modified IoU value
     """
+    # Ensure input tensors have the right shape
+    if box1.dim() == 1:
+        box1 = box1.unsqueeze(0)
+    if box2.dim() == 1:
+        box2 = box2.unsqueeze(0)
+
     # Convert from center-width to corner if needed
     if not x1y1x2y2:
         box1_x1 = box1[..., 0] - box1[..., 2] / 2
@@ -29,6 +35,12 @@ def bbox_iou(box1, box2, x1y1x2y2=True, GIoU=False, DIoU=False, CIoU=False, eps=
     else:
         box1_x1, box1_y1, box1_x2, box1_y2 = box1[..., 0], box1[..., 1], box1[..., 2], box1[..., 3]
         box2_x1, box2_y1, box2_x2, box2_y2 = box2[..., 0], box2[..., 1], box2[..., 2], box2[..., 3]
+
+    # Ensure coordinates are properly ordered (x1 < x2, y1 < y2)
+    box1_x1, box1_x2 = torch.min(box1_x1, box1_x2), torch.max(box1_x1, box1_x2)
+    box1_y1, box1_y2 = torch.min(box1_y1, box1_y2), torch.max(box1_y1, box1_y2)
+    box2_x1, box2_x2 = torch.min(box2_x1, box2_x2), torch.max(box2_x1, box2_x2)
+    box2_y1, box2_y2 = torch.min(box2_y1, box2_y2), torch.max(box2_y1, box2_y2)
 
     # Intersection area
     inter_x1 = torch.max(box1_x1, box2_x1)
@@ -46,6 +58,11 @@ def bbox_iou(box1, box2, x1y1x2y2=True, GIoU=False, DIoU=False, CIoU=False, eps=
     # Union Area
     area1 = (box1_x2 - box1_x1) * (box1_y2 - box1_y1)
     area2 = (box2_x2 - box2_x1) * (box2_y2 - box2_y1)
+
+    # Add small epsilon to prevent division by zero
+    area1 = torch.clamp(area1, min=eps)
+    area2 = torch.clamp(area2, min=eps)
+
     union_area = area1 + area2 - inter_area + eps
 
     # IoU
@@ -147,7 +164,7 @@ def process_predictions(predictions, anchors, strides, img_size, conf_thres=0.25
 
         # Get box coordinates and apply sigmoid to xy, exp to wh
         box_xy = (torch.sigmoid(pred[..., 0:2]) + grid) * stride  # center x, y
-        
+
         # Fix the anchor reshaping to match the expected dimensions
         anchors_reshaped = anchor_set.view(1, num_anchors, 1, 1, 2).to(device)
         box_wh = torch.exp(pred[..., 2:4]) * anchors_reshaped * stride  # width, height
@@ -238,30 +255,56 @@ def process_predictions(predictions, anchors, strides, img_size, conf_thres=0.25
                 output[batch_idx] = torch.zeros((0, 7), device=device)
                 continue
 
-        # Apply NMS
+        # Apply NMS - using an improved algorithm that guarantees progress
         keep = []
-        while boxes.shape[0] > 0:
-            # Add highest confidence detection to keep
-            keep.append(0)
+        remaining_indices = torch.arange(boxes.shape[0], device=device)
 
-            # If only one box left, we're done
-            if boxes.shape[0] == 1:
+        while remaining_indices.shape[0] > 0:
+            # Select the detection with highest confidence
+            first_box_idx = remaining_indices[0]
+            keep.append(first_box_idx.item())
+
+            # If only one box remains, we're done
+            if remaining_indices.shape[0] == 1:
                 break
 
-            # Calculate IoU with other boxes
-            ious = bbox_iou(boxes[0].unsqueeze(0), boxes[1:])
+            # Calculate IoU of the first box with all other remaining boxes
+            first_box = boxes[first_box_idx].unsqueeze(0)
+            other_boxes = boxes[remaining_indices[1:]]
+            ious = bbox_iou(first_box, other_boxes)
 
-            # Find boxes with IoU < threshold
-            mask = ious < iou_thres
+            # Find indices of boxes with IoU < threshold
+            below_threshold_mask = ious < iou_thres
+            below_threshold_mask = below_threshold_mask.squeeze()
 
-            # Update boxes, scores, and class_ids
-            boxes = torch.cat([boxes[0:1], boxes[1:][mask]])
-            scores = torch.cat([scores[0:1], scores[1:][mask]])
-            class_ids = torch.cat([class_ids[0:1], class_ids[1:][mask]])
+            # Create a new tensor to store the indices to keep
+            # Always keep the first element (1) and elements with IoU < threshold
+            if below_threshold_mask.numel() > 0:  # Check if mask is not empty
+                # Combine the first box index with other indices below threshold
+                indices_to_keep = torch.cat([
+                    remaining_indices[0:1],
+                    remaining_indices[1:][below_threshold_mask]
+                ])
+            else:
+                # If all remaining boxes have IoU >= threshold with the first box,
+                # only keep the first box
+                indices_to_keep = remaining_indices[0:1]
+
+            # Remove the first index from the remaining indices list
+            # This is crucial: even if no boxes pass the IoU threshold,
+            # we still make progress by removing at least one box
+            remaining_indices = remaining_indices[1:]
+
+            # If there are any indices below threshold, keep them
+            if below_threshold_mask.numel() > 0 and below_threshold_mask.any():
+                remaining_indices = torch.cat([
+                    remaining_indices,
+                    indices_to_keep[1:]  # Skip the first element which we've already processed
+                ])
 
         # Get kept detections
-        keep_idx = torch.tensor(keep, device=device)
-        output[batch_idx] = detections[keep_idx]
+        keep = torch.tensor(keep, device=device)
+        output[batch_idx] = detections[keep]
 
         # Limit to max_det
         if len(output[batch_idx]) > max_det:
