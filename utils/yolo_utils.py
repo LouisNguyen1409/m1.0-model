@@ -147,7 +147,7 @@ def process_predictions(predictions, anchors, strides, img_size, conf_thres=0.25
 
         # Get box coordinates and apply sigmoid to xy, exp to wh
         box_xy = (torch.sigmoid(pred[..., 0:2]) + grid) * stride  # center x, y
-        
+
         # Fix the anchor reshaping to match the expected dimensions
         anchors_reshaped = anchor_set.view(1, num_anchors, 1, 1, 2).to(device)
         box_wh = torch.exp(pred[..., 2:4]) * anchors_reshaped * stride  # width, height
@@ -253,6 +253,11 @@ def process_predictions(predictions, anchors, strides, img_size, conf_thres=0.25
 
             # Find boxes with IoU < threshold
             mask = ious < iou_thres
+
+            # Check if mask is empty (all boxes overlap with current box)
+            if not mask.any():
+                # If all remaining boxes overlap with the current one, just keep the current one and exit
+                break
 
             # Update boxes, scores, and class_ids
             boxes = torch.cat([boxes[0:1], boxes[1:][mask]])
