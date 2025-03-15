@@ -423,6 +423,10 @@ def evaluate_detections(predictions, targets, iou_threshold=0.5, conf_threshold=
             # Get IoU with all ground truth boxes of this class
             detection_box = detection[:4].unsqueeze(0)  # [1, 4]
 
+            # Ensure gt_boxes is on the same device as detection_box
+            if gt_boxes.device != detection_box.device:
+                gt_boxes = gt_boxes.to(detection_box.device)
+
             # We already have gt_boxes properly set up above
             ious = bbox_iou(detection_box, gt_boxes)
 

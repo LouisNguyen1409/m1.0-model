@@ -339,29 +339,22 @@ def validate(model, dataloader, loss_fn, device, anchors, strides, class_names, 
 
             # Store predictions and targets for mAP calculation
             all_predictions.extend(processed_preds)
-            
-            # Fix the target handling - targets should be handled the same way as in train_one_epoch
-            if isinstance(targets, dict):
-                # If targets is a single dictionary (for the whole batch)
-                all_targets.append({'boxes': targets['boxes'], 'labels': targets['labels']})
-            elif isinstance(targets, list):
-                # If targets is a list of dictionaries (one per image)
-                all_targets.extend([{'boxes': t['boxes'], 'labels': t['labels']} for t in targets])
-            else:
-                # Handle any other case (would need to be debugged)
-                print(f"Warning: Unexpected targets format: {type(targets)}")
-                all_targets.append({'boxes': torch.tensor([], device=device), 'labels': torch.tensor([], device=device)})
+
+            # Create a copy of targets with tensors on the same device as processed_preds
+            batch_target = {}
+            if 'boxes' in targets:
+                batch_target['boxes'] = targets['boxes'].to(device)
+            if 'labels' in targets:
+                batch_target['labels'] = targets['labels'].to(device)
+
+            all_targets.append(batch_target)
 
             # Save some samples for visualization
             if batch_idx == 0:
                 sample_images = images.cpu()
                 sample_preds = processed_preds
-                if isinstance(targets, dict):
-                    sample_targets = {k: v.cpu() if isinstance(v, torch.Tensor) else v 
-                                     for k, v in targets.items()}
-                else:
-                    sample_targets = [{k: v.cpu() if isinstance(v, torch.Tensor) else v
-                                     for k, v in t.items()} for t in targets]
+                sample_targets = {k: v.cpu() if isinstance(v, torch.Tensor) else v
+                                  for k, v in targets.items()}
 
             # Update metrics
             val_loss += loss.item()
