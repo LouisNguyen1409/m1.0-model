@@ -1,406 +1,308 @@
 import os
-import time
-import json
+import cv2
+import math
 import yaml
-import datetime
-import argparse
-import numpy as np
-from tqdm import tqdm
-from PIL import Image
-import matplotlib.pyplot as plt
-import csv
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
-
-# Import model
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+from PIL import Image
+from tqdm import tqdm
 from model import YOLOD11
-# Import dataset
-from datasets import SolarPanelDataset
-# Import utilities
-from utils.loss import YOLOD11Loss
-from utils.yolo_utils import process_predictions
-from utils.visualization import plot_detections, evaluate_detections
-from utils.augmentation import get_train_transforms, get_val_transforms
-from utils.training import (
-    generate_anchors, train_one_epoch, validate, save_checkpoint
-)
+# -------------------------
+# 1. Load data.yaml configuration
+# -------------------------
+
+
+def load_data_yaml(yaml_path):
+    with open(yaml_path, 'r') as f:
+        data = yaml.safe_load(f)
+    # Base path for the dataset
+    base_path = data['path']
+    train_images = os.path.join(base_path, data['train'])
+    val_images = os.path.join(base_path, data['val'])
+    test_images = os.path.join(base_path, data['test'])
+    nc = data['nc']
+    names = data['names']
+    return train_images, val_images, test_images, nc, names
+
+# -------------------------
+# 2. Dataset & Collate Function
+# -------------------------
+
+
+class YOLODataset(Dataset):
+    """
+    Dataset that loads images and YOLO-format labels.
+    Each label file should contain one or more lines:
+         class x_center y_center width height
+    where coordinates are normalized (0-1).
+    Assumes that labels are in a directory parallel to images,
+    with "images" replaced by "labels" in the path.
+    """
+
+    def __init__(self, images_dir, transform=None):
+        self.images_dir = images_dir
+        self.transform = transform
+        self.image_files = [f for f in os.listdir(images_dir) if f.lower().endswith(('.jpg', '.png'))]
+
+        # Derive labels directory from images directory (replace 'images' with 'labels')
+        self.labels_dir = images_dir.replace("images", "labels")
+
+    def __len__(self):
+        return len(self.image_files)
+
+    def __getitem__(self, idx):
+        img_filename = self.image_files[idx]
+        img_path = os.path.join(self.images_dir, img_filename)
+        label_path = os.path.join(self.labels_dir, os.path.splitext(img_filename)[0] + '.txt')
+
+        # Load image
+        image = cv2.imread(img_path)
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        image = Image.fromarray(image)
+        if self.transform:
+            image = self.transform(image)
+        else:
+            image = transforms.ToTensor()(image)
+
+        # Load targets; each target: [class, x_center, y_center, width, height]
+        targets = []
+        if os.path.exists(label_path):
+            with open(label_path, 'r') as f:
+                for line in f.readlines():
+                    parts = line.strip().split()
+                    if len(parts) == 5:
+                        cls, x, y, w, h = map(float, parts)
+                        targets.append([cls, x, y, w, h])
+        targets = torch.tensor(targets) if len(targets) > 0 else torch.zeros((0, 5))
+        return image, targets
 
 
 def collate_fn(batch):
-    """
-    Custom collate function for batching data with variable-sized objects
-    """
-    images = []
-    targets = []
-
-    for img, target in batch:
-        images.append(img)
-        targets.append(target)
-
+    images, targets = list(zip(*batch))
     images = torch.stack(images, 0)
+    return images, list(targets)
 
-    # Convert list of dicts to dict of lists for train_one_epoch
-    if targets and isinstance(targets[0], dict):
-        # Initialize an empty dict to store batched targets
-        batched_targets = {}
-        # Get all keys from the first target dict
-        keys = targets[0].keys()
-        
-        # For each key, collect values from all targets
-        for key in keys:
-            if key == 'img_path':  # Handle non-tensor data differently
-                batched_targets[key] = [target[key] for target in targets]
-            else:
-                # Stack tensors if possible, otherwise store as list
-                try:
-                    batched_targets[key] = torch.stack([target[key] for target in targets])
-                except:
-                    batched_targets[key] = [target[key] for target in targets]
-        
-        return images, batched_targets
-    
-    return images, targets
+# -------------------------
+# 3. YOLO Loss Functions
+# -------------------------
 
 
-def main(args):
+def compute_iou_wh(box1, box2):
     """
-    Main training function
-
-    Args:
-        args: Command line arguments
+    Compute IoU for two boxes specified only by width and height.
+    box1: tensor [w, h]
+    box2: tensor [w, h]
+    Assumes boxes are centered at the origin.
     """
-    # Set device
-    device = torch.device('cuda' if torch.cuda.is_available() and args.cuda else 'cpu')
-    print(f"Using device: {device}")
+    inter = torch.min(box1[0], box2[0]) * torch.min(box1[1], box2[1])
+    union = box1[0] * box1[1] + box2[0] * box2[1] - inter
+    return inter / (union + 1e-16)
 
-    # Create output directory
-    os.makedirs(args.output_dir, exist_ok=True)
 
-    # Create logs directory
-    logs_dir = os.path.join(args.output_dir, 'logs')
-    os.makedirs(logs_dir, exist_ok=True)
+def yolo_loss(pred, targets, anchors, stride, num_classes, ignore_thresh=0.5):
+    """
+    Compute YOLO loss for one scale.
+    - pred: (batch, num_anchors*(5+num_classes), grid, grid)
+    - targets: list (length=batch) of tensors of shape (num_boxes, 5) with normalized coordinates
+    - anchors: list of (w, h) tuples for this scale (in pixels)
+    - stride: stride of the feature map relative to the input (e.g. 8, 16, 32)
+    """
+    device = pred.device
+    batch_size = pred.size(0)
+    num_anchors = len(anchors)
+    grid_size = pred.size(2)
 
-    # Create visualization directory
-    viz_dir = os.path.join(args.output_dir, 'visualizations')
-    os.makedirs(viz_dir, exist_ok=True)
+    # Reshape predictions: (batch, num_anchors, grid, grid, 5+num_classes)
+    pred = pred.view(batch_size, num_anchors, 5+num_classes, grid_size, grid_size).permute(0, 1, 3, 4, 2).contiguous()
 
-    # Initialize tensorboard writer
-    writer = SummaryWriter(log_dir=os.path.join(args.output_dir, 'tensorboard'))
+    # Apply sigmoid activations
+    pred[..., 0] = torch.sigmoid(pred[..., 0])  # x
+    pred[..., 1] = torch.sigmoid(pred[..., 1])  # y
+    pred[..., 4] = torch.sigmoid(pred[..., 4])  # objectness
+    pred[..., 5:] = torch.sigmoid(pred[..., 5:])  # class scores
 
+    # Build grid
+    grid_x = torch.arange(grid_size, device=device).repeat(grid_size, 1).view(1, 1, grid_size, grid_size).float()
+    grid_y = torch.arange(grid_size, device=device).repeat(grid_size, 1).t().view(1, 1, grid_size, grid_size).float()
+
+    # Predicted bounding boxes in pixels (assume input image 640x640)
+    pred_boxes = torch.zeros_like(pred[..., :4])
+    pred_boxes[..., 0] = (grid_x + pred[..., 0]) * stride
+    pred_boxes[..., 1] = (grid_y + pred[..., 1]) * stride
+    anchor_w = torch.tensor([a[0] for a in anchors], device=device).view(1, num_anchors, 1, 1).float()
+    anchor_h = torch.tensor([a[1] for a in anchors], device=device).view(1, num_anchors, 1, 1).float()
+    pred_boxes[..., 2] = torch.exp(pred[..., 2]) * anchor_w * stride
+    pred_boxes[..., 3] = torch.exp(pred[..., 3]) * anchor_h * stride
+
+    # Prepare target tensors for each grid cell and anchor
+    obj_mask = torch.zeros(batch_size, num_anchors, grid_size, grid_size, device=device)
+    noobj_mask = torch.ones(batch_size, num_anchors, grid_size, grid_size, device=device)
+    tx = torch.zeros(batch_size, num_anchors, grid_size, grid_size, device=device)
+    ty = torch.zeros(batch_size, num_anchors, grid_size, grid_size, device=device)
+    tw = torch.zeros(batch_size, num_anchors, grid_size, grid_size, device=device)
+    th = torch.zeros(batch_size, num_anchors, grid_size, grid_size, device=device)
+    tconf = torch.zeros(batch_size, num_anchors, grid_size, grid_size, device=device)
+    tcls = torch.zeros(batch_size, num_anchors, grid_size, grid_size, num_classes, device=device)
+
+    # Assign targets to grid cells and anchors
+    for b in range(batch_size):
+        if targets[b].numel() == 0:
+            continue
+        for target in targets[b]:
+            cls = int(target[0])
+            gx = target[1] * grid_size  # scale normalized x_center to grid
+            gy = target[2] * grid_size  # scale normalized y_center to grid
+            gw = target[3] * 640         # scale normalized width to pixels
+            gh = target[4] * 640         # scale normalized height to pixels
+            gi = int(gx)
+            gj = int(gy)
+            best_iou = 0
+            best_anchor = 0
+            for i, anchor in enumerate(anchors):
+                iou = compute_iou_wh(torch.tensor([gw, gh], device=device),
+                                     torch.tensor(anchor, device=device))
+                if iou > best_iou:
+                    best_iou = iou
+                    best_anchor = i
+            obj_mask[b, best_anchor, gj, gi] = 1
+            noobj_mask[b, best_anchor, gj, gi] = 0
+            tx[b, best_anchor, gj, gi] = gx - gi
+            ty[b, best_anchor, gj, gi] = gy - gj
+            tw[b, best_anchor, gj, gi] = math.log(gw / (anchors[best_anchor][0] + 1e-16) + 1e-16)
+            th[b, best_anchor, gj, gi] = math.log(gh / (anchors[best_anchor][1] + 1e-16) + 1e-16)
+            tconf[b, best_anchor, gj, gi] = 1
+            tcls[b, best_anchor, gj, gi, cls] = 1
+
+            # Optionally ignore anchors with high IoU but not best
+            for i in range(num_anchors):
+                if i == best_anchor:
+                    continue
+                if compute_iou_wh(torch.tensor([gw, gh], device=device),
+                                  torch.tensor(anchors[i], device=device)) > ignore_thresh:
+                    noobj_mask[b, i, gj, gi] = 0
+
+    mse_loss = nn.MSELoss(reduction='sum')
+    bce_loss = nn.BCELoss(reduction='sum')
+
+    loss_x = mse_loss(pred[..., 0] * obj_mask, tx * obj_mask)
+    loss_y = mse_loss(pred[..., 1] * obj_mask, ty * obj_mask)
+    loss_w = mse_loss(pred[..., 2] * obj_mask, tw * obj_mask)
+    loss_h = mse_loss(pred[..., 3] * obj_mask, th * obj_mask)
+    loss_box = loss_x + loss_y + loss_w + loss_h
+
+    loss_obj = bce_loss(pred[..., 4] * obj_mask, tconf * obj_mask)
+    loss_noobj = bce_loss(pred[..., 4] * noobj_mask, tconf * noobj_mask)
+
+    loss_cls = bce_loss(pred[..., 5:] * obj_mask.unsqueeze(-1), tcls * obj_mask.unsqueeze(-1))
+
+    total_loss = loss_box + loss_obj + loss_noobj + loss_cls
+    return total_loss / batch_size
+
+# -------------------------
+# 4. Training and Validation Functions
+# -------------------------
+
+
+def train_one_epoch(model, dataloader, optimizer, device, anchors, num_classes):
+    model.train()
+    running_loss = 0.0
+    anchors_small = anchors['small']
+    anchors_medium = anchors['medium']
+    anchors_large = anchors['large']
+
+    pbar = tqdm(dataloader, desc="Training", leave=False)
+    for images, targets in pbar:
+        images = images.to(device)
+        optimizer.zero_grad()
+        # Forward pass – model outputs predictions at three scales.
+        small_pred, medium_pred, large_pred = model(images)
+
+        loss_small = yolo_loss(small_pred, targets, anchors_small, stride=8, num_classes=num_classes)
+        loss_medium = yolo_loss(medium_pred, targets, anchors_medium, stride=16, num_classes=num_classes)
+        loss_large = yolo_loss(large_pred, targets, anchors_large, stride=32, num_classes=num_classes)
+        loss = loss_small + loss_medium + loss_large
+        loss.backward()
+        optimizer.step()
+        running_loss += loss.item()
+        pbar.set_postfix(loss=f"{loss.item():.4f}")
+    avg_loss = running_loss / len(dataloader)
+    return avg_loss
+
+
+@torch.no_grad()
+def validate(model, dataloader, device, anchors, num_classes):
+    model.eval()
+    running_loss = 0.0
+    anchors_small = anchors['small']
+    anchors_medium = anchors['medium']
+    anchors_large = anchors['large']
+
+    pbar = tqdm(dataloader, desc="Validation", leave=False)
+    for images, targets in pbar:
+        images = images.to(device)
+        small_pred, medium_pred, large_pred = model(images)
+        loss_small = yolo_loss(small_pred, targets, anchors_small, stride=8, num_classes=num_classes)
+        loss_medium = yolo_loss(medium_pred, targets, anchors_medium, stride=16, num_classes=num_classes)
+        loss_large = yolo_loss(large_pred, targets, anchors_large, stride=32, num_classes=num_classes)
+        loss = loss_small + loss_medium + loss_large
+        running_loss += loss.item()
+        pbar.set_postfix(loss=f"{loss.item():.4f}")
+    avg_loss = running_loss / len(dataloader)
+    return avg_loss
+
+# -------------------------
+# 5. Main Training Script
+# -------------------------
+
+
+def main():
     # Load YAML configuration
-    with open(args.data_yaml, 'r') as f:
-        yaml_cfg = yaml.safe_load(f)
+    train_images_dir, val_images_dir, _, num_classes, names = load_data_yaml("data.yaml")
+    print(f"Loaded dataset with {num_classes} classes: {names}")
 
-    # Get number of classes and class names from YAML
-    num_classes = yaml_cfg.get('nc', args.num_classes)
-    class_names = yaml_cfg.get('names', [])
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    num_epochs = 50
+    batch_size = 8
+    learning_rate = 1e-4
 
-    print(f"Number of classes: {num_classes}")
-    print(f"Class names: {class_names}")
+    # Define anchors for each scale (in pixels)
+    anchors = {
+        'small': [(10, 13), (16, 30), (33, 23)],      # For 80x80 feature map (stride 8)
+        'medium': [(30, 61), (62, 45), (59, 119)],      # For 40x40 feature map (stride 16)
+        'large': [(116, 90), (156, 198), (373, 326)]     # For 20x20 feature map (stride 32)
+    }
 
-    # Create CSV log file for losses
-    csv_path = os.path.join(logs_dir, 'training_log.csv')
-    csv_file = open(csv_path, 'w', newline='')
-    csv_writer = csv.writer(csv_file)
-    csv_writer.writerow(['Epoch', 'Train_Loss', 'Train_Box', 'Train_Obj', 'Train_Cls',
-                         'Val_Loss', 'Val_Box', 'Val_Obj', 'Val_Cls', 'mAP', 'LR'])
+    transform = transforms.Compose([
+        transforms.Resize((640, 640)),
+        transforms.ToTensor(),
+    ])
 
-    # Create datasets
-    print("Loading datasets...")
-    train_dataset = SolarPanelDataset(
-        data_root=args.data_root,
-        yaml_file=args.data_yaml,
-        split='train',
-        img_size=args.img_size,
-        transform=get_train_transforms(args.img_size)
-    )
+    # Create datasets and dataloaders for train and validation.
+    train_dataset = YOLODataset(train_images_dir, transform=transform)
+    val_dataset = YOLODataset(val_images_dir, transform=transform)
 
-    val_dataset = SolarPanelDataset(
-        data_root=args.data_root,
-        yaml_file=args.data_yaml,
-        split='val',
-        img_size=args.img_size,
-        transform=get_val_transforms(args.img_size)
-    )
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
+                              num_workers=4, collate_fn=collate_fn)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
+                            num_workers=4, collate_fn=collate_fn)
 
-    # Define dataloaders
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        collate_fn=collate_fn
-    )
+    # Initialize model, optimizer
+    model = YOLOD11(num_classes=num_classes).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        collate_fn=collate_fn
-    )
+    # Training loop with validation step
+    for epoch in range(num_epochs):
+        train_loss = train_one_epoch(model, train_loader, optimizer, device, anchors, num_classes)
+        val_loss = validate(model, val_loader, device, anchors, num_classes)
+        print(f"Epoch [{epoch+1}/{num_epochs}] - Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
 
-    # Generate anchors from dataset
-    anchors = generate_anchors(
-        train_dataset,
-        num_anchors=9,
-        strides=[8, 16, 32],
-        img_size=args.img_size
-    )
-
-    # Define strides for each feature map scale
-    strides = [8, 16, 32]
-
-    # Create model
-    print("Initializing YOLOD11 model...")
-    model = YOLOD11(num_classes=num_classes)
-    model.to(device)
-
-    # Print model summary
-    num_params = sum(p.numel() for p in model.parameters())
-    print(f"Model created with {num_params:,} parameters")
-
-    # Define loss function with generated anchors
-    loss_fn = YOLOD11Loss(num_classes=num_classes, anchors=anchors)
-    loss_fn.to(device)
-
-    # Define optimizer
-    optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-
-    # Define learning rate scheduler
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode='min',
-        factor=0.5,
-        patience=5,
-        verbose=True
-    )
-
-    # Load pretrained weights if specified
-    start_epoch = 0
-    best_val_loss = float('inf')
-    best_mAP = 0.0
-
-    if args.resume:
-        if os.path.isfile(args.resume):
-            print(f"Loading checkpoint from {args.resume}")
-            checkpoint = torch.load(args.resume, map_location=device)
-            model.load_state_dict(checkpoint['model_state_dict'])
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            start_epoch = checkpoint['epoch'] + 1
-
-            if 'val_loss' in checkpoint:
-                best_val_loss = checkpoint['val_loss']
-            if 'mAP' in checkpoint:
-                best_mAP = checkpoint['mAP']
-
-            print(f"Resuming from epoch {start_epoch}")
-            print(f"Best validation loss: {best_val_loss:.6f}")
-            print(f"Best mAP: {best_mAP:.6f}")
-        else:
-            print(f"No checkpoint found at {args.resume}, starting from scratch")
-
-    # Training loop
-    start_time = time.time()
-
-    print(f"\n{'='*80}")
-    print(f"Starting training for {args.epochs} epochs")
-    print(f"{'='*80}\n")
-
-    for epoch in range(start_epoch, args.epochs):
-        print(f"\n{'='*80}")
-        print(f"Epoch {epoch+1}/{args.epochs} - {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-
-        # Train for one epoch
-        train_metrics = train_one_epoch(
-            model=model,
-            dataloader=train_loader,
-            optimizer=optimizer,
-            loss_fn=loss_fn,
-            device=device,
-            epoch=epoch,
-            anchors=anchors,
-            strides=strides
-        )
-
-        # Validate
-        val_metrics = validate(
-            model=model,
-            dataloader=val_loader,
-            loss_fn=loss_fn,
-            device=device,
-            anchors=anchors,
-            strides=strides,
-            class_names=class_names,
-            conf_threshold=0.25,
-            iou_threshold=0.45
-        )
-
-        # Get current learning rate
-        current_lr = optimizer.param_groups[0]['lr']
-
-        # Update learning rate scheduler
-        scheduler.step(val_metrics['loss'])
-
-        # Log metrics to tensorboard
-        writer.add_scalar('Loss/train', train_metrics['loss'], epoch)
-        writer.add_scalar('Loss/val', val_metrics['loss'], epoch)
-        writer.add_scalar('BoxLoss/train', train_metrics['box_loss'], epoch)
-        writer.add_scalar('BoxLoss/val', val_metrics['box_loss'], epoch)
-        writer.add_scalar('ObjLoss/train', train_metrics['obj_loss'], epoch)
-        writer.add_scalar('ObjLoss/val', val_metrics['obj_loss'], epoch)
-        writer.add_scalar('ClsLoss/train', train_metrics['cls_loss'], epoch)
-        writer.add_scalar('ClsLoss/val', val_metrics['cls_loss'], epoch)
-        writer.add_scalar('mAP', val_metrics['mAP'], epoch)
-        writer.add_scalar('LR', current_lr, epoch)
-
-        # Log precision and recall for each class
-        for i, (prec, rec) in enumerate(zip(val_metrics['precision'], val_metrics['recall'])):
-            class_name = class_names[i] if i < len(class_names) else f"Class {i}"
-            writer.add_scalar(f'Precision/{class_name}', prec, epoch)
-            writer.add_scalar(f'Recall/{class_name}', rec, epoch)
-
-        # Log to CSV
-        csv_writer.writerow([
-            epoch + 1,
-            train_metrics['loss'], train_metrics['box_loss'], train_metrics['obj_loss'], train_metrics['cls_loss'],
-            val_metrics['loss'], val_metrics['box_loss'], val_metrics['obj_loss'], val_metrics['cls_loss'],
-            val_metrics['mAP'],
-            current_lr
-        ])
-        csv_file.flush()  # Make sure data is written immediately
-
-        # Save visualization of predictions
-        if 'sample_images' in val_metrics and len(val_metrics['sample_images']) > 0:
-            for i in range(min(3, len(val_metrics['sample_images']))):
-                image = val_metrics['sample_images'][i].permute(1, 2, 0).numpy()
-
-                # Plot detections
-                fig, _ = plot_detections(
-                    image,
-                    val_metrics['sample_preds'][i],
-                    class_names,
-                    conf_threshold=0.25
-                )
-
-                # Save figure
-                fig_path = os.path.join(viz_dir, f'epoch{epoch+1:03d}_sample{i+1}.png')
-                fig.savefig(fig_path)
-                plt.close(fig)
-
-                # Log to tensorboard
-                writer.add_figure(f'Predictions/Sample{i+1}', fig, epoch)
-
-        # Print epoch summary
-        print(f"\nEpoch {epoch+1}/{args.epochs} Summary:")
-        print(f"  Train Loss: {train_metrics['loss']:.6f}")
-        print(f"  Train Box: {train_metrics['box_loss']:.6f}")
-        print(f"  Train Obj: {train_metrics['obj_loss']:.6f}")
-        print(f"  Train Cls: {train_metrics['cls_loss']:.6f}")
-        print(f"  Val Loss: {val_metrics['loss']:.6f}")
-        print(f"  Val Box: {val_metrics['box_loss']:.6f}")
-        print(f"  Val Obj: {val_metrics['obj_loss']:.6f}")
-        print(f"  Val Cls: {val_metrics['cls_loss']:.6f}")
-        print(f"  mAP@0.5: {val_metrics['mAP']:.6f}")
-        print(f"  Learning Rate: {current_lr:.8f}")
-        print(f"  Time: {(time.time() - start_time)/60:.2f} minutes")
-
-        # Combined train/val loss dictionary
-        loss_dict = {
-            'train_loss': train_metrics['loss'],
-            'train_box_loss': train_metrics['box_loss'],
-            'train_obj_loss': train_metrics['obj_loss'],
-            'train_cls_loss': train_metrics['cls_loss'],
-            'val_loss': val_metrics['loss'],
-            'val_box_loss': val_metrics['box_loss'],
-            'val_obj_loss': val_metrics['obj_loss'],
-            'val_cls_loss': val_metrics['cls_loss'],
-            'mAP': val_metrics['mAP'],
-            'learning_rate': current_lr,
-            'epoch': epoch + 1
-        }
-
-        # Save checkpoint every save_interval epochs
-        if (epoch + 1) % args.save_interval == 0:
-            checkpoint_path = os.path.join(
-                args.output_dir,
-                f"checkpoint_epoch{epoch+1}.pth"
-            )
-            save_checkpoint(model, optimizer, epoch, loss_dict, checkpoint_path)
-
-        # Save best model by loss
-        if val_metrics['loss'] < best_val_loss:
-            best_val_loss = val_metrics['loss']
-            best_model_path = os.path.join(args.output_dir, "best_loss_model.pth")
-            save_checkpoint(model, optimizer, epoch, loss_dict, best_model_path, is_best=True)
-            print(f"  New best model saved with validation loss: {best_val_loss:.6f}")
-
-        # Save best model by mAP
-        if val_metrics['mAP'] > best_mAP:
-            best_mAP = val_metrics['mAP']
-            best_map_model_path = os.path.join(args.output_dir, "best_map_model.pth")
-            loss_dict['best_metric'] = 'mAP'
-            save_checkpoint(model, optimizer, epoch, loss_dict, best_map_model_path, is_best=True)
-            print(f"  New best model saved with mAP: {best_mAP:.6f}")
-
-        # Save latest model (overwrite)
-        latest_model_path = os.path.join(args.output_dir, "latest_model.pth")
-        save_checkpoint(model, optimizer, epoch, loss_dict, latest_model_path)
-
-    # Save final model
-    final_model_path = os.path.join(args.output_dir, "final_model.pth")
-    save_checkpoint(model, optimizer, args.epochs-1, loss_dict, final_model_path)
-    print(f"\nTraining completed. Final model saved: {final_model_path}")
-
-    # Close CSV file and tensorboard writer
-    csv_file.close()
-    writer.close()
-
-    # Print total training time
-    total_time = time.time() - start_time
-    print(f"Total training time: {total_time/60:.2f} minutes ({total_time/3600:.2f} hours)")
+    # Save final model weights
+    torch.save(model.state_dict(), "yolod11_final.pth")
+    print("Training complete and model saved.")
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='Train YOLOD11 for solar panel inspection')
-
-    # Dataset parameters
-    parser.add_argument('--data-root', type=str, required=True,
-                        help='Root directory containing the dataset')
-    parser.add_argument('--data-yaml', type=str, required=True,
-                        help='Path to YAML configuration file')
-    parser.add_argument('--num-classes', type=int, default=7,
-                        help='Number of classes (overridden by YAML if present)')
-    parser.add_argument('--img-size', type=int, default=640,
-                        help='Input image size')
-
-    # Training parameters
-    parser.add_argument('--batch-size', type=int, default=16,
-                        help='Batch size for training')
-    parser.add_argument('--epochs', type=int, default=100,
-                        help='Number of epochs to train for')
-    parser.add_argument('--lr', type=float, default=0.001,
-                        help='Initial learning rate')
-    parser.add_argument('--weight-decay', type=float, default=0.0005,
-                        help='Weight decay for optimizer')
-    parser.add_argument('--num-workers', type=int, default=4,
-                        help='Number of worker threads for data loading')
-    parser.add_argument('--cuda', action='store_true',
-                        help='Use CUDA if available')
-
-    # Saving parameters
-    parser.add_argument('--output-dir', type=str, default='./output',
-                        help='Directory to save outputs')
-    parser.add_argument('--save-interval', type=int, default=5,
-                        help='Save model every N epochs')
-    parser.add_argument('--resume', type=str, default=None,
-                        help='Path to checkpoint to resume training from')
-
-    args = parser.parse_args()
-    main(args)
+if __name__ == '__main__':
+    main()
