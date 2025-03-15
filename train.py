@@ -1,6 +1,7 @@
 import os
 import cv2
 import math
+import csv
 import yaml
 import torch
 import torch.nn as nn
@@ -9,7 +10,8 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from PIL import Image
 from tqdm import tqdm
-from model import YOLOD11
+from model import YOLOD11  # Ensure this module is available
+
 # -------------------------
 # 1. Load data.yaml configuration
 # -------------------------
@@ -46,7 +48,6 @@ class YOLODataset(Dataset):
         self.images_dir = images_dir
         self.transform = transform
         self.image_files = [f for f in os.listdir(images_dir) if f.lower().endswith(('.jpg', '.png'))]
-
         # Derive labels directory from images directory (replace 'images' with 'labels')
         self.labels_dir = images_dir.replace("images", "labels")
 
@@ -57,7 +58,6 @@ class YOLODataset(Dataset):
         img_filename = self.image_files[idx]
         img_path = os.path.join(self.images_dir, img_filename)
         label_path = os.path.join(self.labels_dir, os.path.splitext(img_filename)[0] + '.txt')
-
         # Load image
         image = cv2.imread(img_path)
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
@@ -66,7 +66,6 @@ class YOLODataset(Dataset):
             image = self.transform(image)
         else:
             image = transforms.ToTensor()(image)
-
         # Load targets; each target: [class, x_center, y_center, width, height]
         targets = []
         if os.path.exists(label_path):
@@ -86,7 +85,7 @@ def collate_fn(batch):
     return images, list(targets)
 
 # -------------------------
-# 3. YOLO Loss Functions
+# 3. Helper Functions: IoU and Loss Components
 # -------------------------
 
 
@@ -102,13 +101,11 @@ def compute_iou_wh(box1, box2):
     return inter / (union + 1e-16)
 
 
-def yolo_loss(pred, targets, anchors, stride, num_classes, ignore_thresh=0.5):
+def yolo_loss_components(pred, targets, anchors, stride, num_classes, ignore_thresh=0.5):
     """
-    Compute YOLO loss for one scale.
-    - pred: (batch, num_anchors*(5+num_classes), grid, grid)
-    - targets: list (length=batch) of tensors of shape (num_boxes, 5) with normalized coordinates
-    - anchors: list of (w, h) tuples for this scale (in pixels)
-    - stride: stride of the feature map relative to the input (e.g. 8, 16, 32)
+    Compute YOLO loss for one scale and return each component.
+    Returns:
+        loss_box, loss_obj, loss_noobj, loss_cls, total_loss
     """
     device = pred.device
     batch_size = pred.size(0)
@@ -116,7 +113,8 @@ def yolo_loss(pred, targets, anchors, stride, num_classes, ignore_thresh=0.5):
     grid_size = pred.size(2)
 
     # Reshape predictions: (batch, num_anchors, grid, grid, 5+num_classes)
-    pred = pred.view(batch_size, num_anchors, 5+num_classes, grid_size, grid_size).permute(0, 1, 3, 4, 2).contiguous()
+    pred = pred.view(batch_size, num_anchors, 5+num_classes, grid_size, grid_size)
+    pred = pred.permute(0, 1, 3, 4, 2).contiguous()
 
     # Apply sigmoid activations
     pred[..., 0] = torch.sigmoid(pred[..., 0])  # x
@@ -195,11 +193,10 @@ def yolo_loss(pred, targets, anchors, stride, num_classes, ignore_thresh=0.5):
 
     loss_obj = bce_loss(pred[..., 4] * obj_mask, tconf * obj_mask)
     loss_noobj = bce_loss(pred[..., 4] * noobj_mask, tconf * noobj_mask)
-
     loss_cls = bce_loss(pred[..., 5:] * obj_mask.unsqueeze(-1), tcls * obj_mask.unsqueeze(-1))
 
     total_loss = loss_box + loss_obj + loss_noobj + loss_cls
-    return total_loss / batch_size
+    return loss_box, loss_obj, loss_noobj, loss_cls, total_loss / batch_size
 
 # -------------------------
 # 4. Training and Validation Functions
@@ -208,7 +205,13 @@ def yolo_loss(pred, targets, anchors, stride, num_classes, ignore_thresh=0.5):
 
 def train_one_epoch(model, dataloader, optimizer, device, anchors, num_classes):
     model.train()
-    running_loss = 0.0
+    loss_history = {
+        "loss_box": 0.0,
+        "loss_obj": 0.0,
+        "loss_noobj": 0.0,
+        "loss_cls": 0.0,
+        "total_loss": 0.0
+    }
     anchors_small = anchors['small']
     anchors_medium = anchors['medium']
     anchors_large = anchors['large']
@@ -217,25 +220,53 @@ def train_one_epoch(model, dataloader, optimizer, device, anchors, num_classes):
     for images, targets in pbar:
         images = images.to(device)
         optimizer.zero_grad()
+
         # Forward pass – model outputs predictions at three scales.
         small_pred, medium_pred, large_pred = model(images)
 
-        loss_small = yolo_loss(small_pred, targets, anchors_small, stride=8, num_classes=num_classes)
-        loss_medium = yolo_loss(medium_pred, targets, anchors_medium, stride=16, num_classes=num_classes)
-        loss_large = yolo_loss(large_pred, targets, anchors_large, stride=32, num_classes=num_classes)
+        lb_box, lb_obj, lb_noobj, lb_cls, loss_small = yolo_loss_components(
+            small_pred, targets, anchors_small, stride=8, num_classes=num_classes)
+        lm_box, lm_obj, lm_noobj, lm_cls, loss_medium = yolo_loss_components(
+            medium_pred, targets, anchors_medium, stride=16, num_classes=num_classes)
+        ll_box, ll_obj, ll_noobj, ll_cls, loss_large = yolo_loss_components(
+            large_pred, targets, anchors_large, stride=32, num_classes=num_classes)
+
+        # Sum losses from all scales
+        loss_box = lb_box + lm_box + ll_box
+        loss_obj = lb_obj + lm_obj + ll_obj
+        loss_noobj = lb_noobj + lm_noobj + ll_noobj
+        loss_cls = lb_cls + lm_cls + ll_cls
         loss = loss_small + loss_medium + loss_large
+
         loss.backward()
         optimizer.step()
-        running_loss += loss.item()
+
+        loss_history["loss_box"] += loss_box.item()
+        loss_history["loss_obj"] += loss_obj.item()
+        loss_history["loss_noobj"] += loss_noobj.item()
+        loss_history["loss_cls"] += loss_cls.item()
+        loss_history["total_loss"] += loss.item()
+
         pbar.set_postfix(loss=f"{loss.item():.4f}")
-    avg_loss = running_loss / len(dataloader)
-    return avg_loss
+
+    # Average losses over batches
+    num_batches = len(dataloader)
+    for key in loss_history:
+        loss_history[key] /= num_batches
+
+    return loss_history
 
 
 @torch.no_grad()
 def validate(model, dataloader, device, anchors, num_classes):
     model.eval()
-    running_loss = 0.0
+    loss_history = {
+        "loss_box": 0.0,
+        "loss_obj": 0.0,
+        "loss_noobj": 0.0,
+        "loss_cls": 0.0,
+        "total_loss": 0.0
+    }
     anchors_small = anchors['small']
     anchors_medium = anchors['medium']
     anchors_large = anchors['large']
@@ -244,14 +275,33 @@ def validate(model, dataloader, device, anchors, num_classes):
     for images, targets in pbar:
         images = images.to(device)
         small_pred, medium_pred, large_pred = model(images)
-        loss_small = yolo_loss(small_pred, targets, anchors_small, stride=8, num_classes=num_classes)
-        loss_medium = yolo_loss(medium_pred, targets, anchors_medium, stride=16, num_classes=num_classes)
-        loss_large = yolo_loss(large_pred, targets, anchors_large, stride=32, num_classes=num_classes)
+
+        lb_box, lb_obj, lb_noobj, lb_cls, loss_small = yolo_loss_components(
+            small_pred, targets, anchors_small, stride=8, num_classes=num_classes)
+        lm_box, lm_obj, lm_noobj, lm_cls, loss_medium = yolo_loss_components(
+            medium_pred, targets, anchors_medium, stride=16, num_classes=num_classes)
+        ll_box, ll_obj, ll_noobj, ll_cls, loss_large = yolo_loss_components(
+            large_pred, targets, anchors_large, stride=32, num_classes=num_classes)
+
+        loss_box = lb_box + lm_box + ll_box
+        loss_obj = lb_obj + lm_obj + ll_obj
+        loss_noobj = lb_noobj + lm_noobj + ll_noobj
+        loss_cls = lb_cls + lm_cls + ll_cls
         loss = loss_small + loss_medium + loss_large
-        running_loss += loss.item()
+
+        loss_history["loss_box"] += loss_box.item()
+        loss_history["loss_obj"] += loss_obj.item()
+        loss_history["loss_noobj"] += loss_noobj.item()
+        loss_history["loss_cls"] += loss_cls.item()
+        loss_history["total_loss"] += loss.item()
+
         pbar.set_postfix(loss=f"{loss.item():.4f}")
-    avg_loss = running_loss / len(dataloader)
-    return avg_loss
+
+    num_batches = len(dataloader)
+    for key in loss_history:
+        loss_history[key] /= num_batches
+
+    return loss_history
 
 # -------------------------
 # 5. Main Training Script
@@ -280,7 +330,6 @@ def main():
         transforms.ToTensor(),
     ])
 
-    # Create datasets and dataloaders for train and validation.
     train_dataset = YOLODataset(train_images_dir, transform=transform)
     val_dataset = YOLODataset(val_images_dir, transform=transform)
 
@@ -289,19 +338,47 @@ def main():
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
                             num_workers=4, collate_fn=collate_fn)
 
-    # Initialize model, optimizer
     model = YOLOD11(num_classes=num_classes).to(device)
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 
-    # Training loop with validation step
-    for epoch in range(num_epochs):
-        train_loss = train_one_epoch(model, train_loader, optimizer, device, anchors, num_classes)
-        val_loss = validate(model, val_loader, device, anchors, num_classes)
-        print(f"Epoch [{epoch+1}/{num_epochs}] - Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
+    # Prepare a list to store losses for CSV saving
+    csv_rows = []
+    headers = [
+        "epoch",
+        "train_total", "train_loss_box", "train_loss_obj", "train_loss_noobj", "train_loss_cls",
+        "val_total", "val_loss_box", "val_loss_obj", "val_loss_noobj", "val_loss_cls"
+    ]
+    csv_rows.append(headers)
 
-    # Save final model weights
+    for epoch in range(num_epochs):
+        train_loss_components = train_one_epoch(model, train_loader, optimizer, device, anchors, num_classes)
+        val_loss_components = validate(model, val_loader, device, anchors, num_classes)
+
+        # Print losses
+        print(f"Epoch [{epoch+1}/{num_epochs}]")
+        print(f"  Train Loss: {train_loss_components['total_loss']:.4f} (Box: {train_loss_components['loss_box']:.4f}, Obj: {train_loss_components['loss_obj']:.4f}, NoObj: {train_loss_components['loss_noobj']:.4f}, Cls: {train_loss_components['loss_cls']:.4f})")
+        print(f"  Val Loss:   {val_loss_components['total_loss']:.4f} (Box: {val_loss_components['loss_box']:.4f}, Obj: {val_loss_components['loss_obj']:.4f}, NoObj: {val_loss_components['loss_noobj']:.4f}, Cls: {val_loss_components['loss_cls']:.4f})")
+
+        # Append current epoch's losses to CSV rows
+        row = [
+            epoch+1,
+            train_loss_components["total_loss"], train_loss_components["loss_box"], train_loss_components["loss_obj"],
+            train_loss_components["loss_noobj"], train_loss_components["loss_cls"],
+            val_loss_components["total_loss"], val_loss_components["loss_box"], val_loss_components["loss_obj"],
+            val_loss_components["loss_noobj"], val_loss_components["loss_cls"]
+        ]
+        csv_rows.append(row)
+
+    # Save the model weights
     torch.save(model.state_dict(), "yolod11_final.pth")
-    print("Training complete and model saved.")
+
+    # Save losses to CSV file
+    csv_file = "loss_history.csv"
+    with open(csv_file, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerows(csv_rows)
+
+    print("Training complete, model and loss history saved to CSV.")
 
 
 if __name__ == '__main__':
