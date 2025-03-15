@@ -260,12 +260,12 @@ def validate(model, dataloader, device, anchors, num_classes):
 
 def main():
     # Load YAML configuration
-    train_images_dir, val_images_dir, _, num_classes, names = load_data_yaml("data.yaml")
+    train_images_dir, val_images_dir, _, num_classes, names = load_data_yaml("dataset/data.yaml")
     print(f"Loaded dataset with {num_classes} classes: {names}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    num_epochs = 50
-    batch_size = 8
+    num_epochs = 10
+    batch_size = 16
     learning_rate = 1e-4
 
     # Define anchors for each scale (in pixels)
