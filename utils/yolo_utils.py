@@ -275,32 +275,24 @@ def process_predictions(predictions, anchors, strides, img_size, conf_thres=0.25
 
             # Find indices of boxes with IoU < threshold
             below_threshold_mask = ious < iou_thres
-            below_threshold_mask = below_threshold_mask.squeeze()
 
-            # Create a new tensor to store the indices to keep
-            # Always keep the first element (1) and elements with IoU < threshold
-            if below_threshold_mask.numel() > 0:  # Check if mask is not empty
-                # Combine the first box index with other indices below threshold
-                indices_to_keep = torch.cat([
-                    remaining_indices[0:1],
-                    remaining_indices[1:][below_threshold_mask]
-                ])
-            else:
-                # If all remaining boxes have IoU >= threshold with the first box,
-                # only keep the first box
-                indices_to_keep = remaining_indices[0:1]
+            # Handle dimension issues - make sure mask is 1D
+            if below_threshold_mask.dim() > 1:
+                below_threshold_mask = below_threshold_mask.squeeze()
 
-            # Remove the first index from the remaining indices list
-            # This is crucial: even if no boxes pass the IoU threshold,
-            # we still make progress by removing at least one box
+            # Handle case where only one box is being compared (mask becomes 0D)
+            if below_threshold_mask.dim() == 0:
+                below_threshold_mask = below_threshold_mask.unsqueeze(0)
+
+            # Always remove the first box from remaining_indices
             remaining_indices = remaining_indices[1:]
 
-            # If there are any indices below threshold, keep them
+            # If there are any boxes below threshold, keep them in remaining_indices
             if below_threshold_mask.numel() > 0 and below_threshold_mask.any():
-                remaining_indices = torch.cat([
-                    remaining_indices,
-                    indices_to_keep[1:]  # Skip the first element which we've already processed
-                ])
+                # Get indices that are below threshold
+                keep_indices = remaining_indices[below_threshold_mask]
+                # Update remaining indices
+                remaining_indices = keep_indices
 
         # Get kept detections
         keep = torch.tensor(keep, device=device)
