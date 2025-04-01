@@ -1,0 +1,43 @@
+# YOLOD11 training configuration
+
+# Model configuration
+model_name: 'YOLOD11'
+img_size: 640
+anchors:
+  - [10, 13, 16, 30, 33, 23] # Small objects (stride 8)
+  - [30, 61, 62, 45, 59, 119] # Medium objects (stride 16)
+  - [116, 90, 156, 198, 373, 326] # Large objects (stride 32)
+strides: [8, 16, 32]
+
+# Dataset configuration
+data_yaml: 'data/coco.yaml'
+
+# Training parameters
+batch_size: 16
+epochs: 300
+workers: 8
+lr: 0.01
+weight_decay: 0.0005
+momentum: 0.937
+warmup_epochs: 3
+warmup_bias_lr: 0.1
+warmup_momentum: 0.8
+lr_schedule: 'cosine'
+
+# Checkpoint parameters
+save_dir: 'runs/train'
+save_period: 10
+eval_period: 5
+
+# Hardware options
+device: 'cuda'
+sync_bn: false
+use_amp: true
+use_ema: true
+
+# Debugging
+debug: false
+
+# Pretrained model (optional)
+pretrained: ''
+resume: false
