@@ -60,9 +60,9 @@ class SpatialAttention(nn.Module):
         return x * self.sigmoid(out)
 
 
-class CRAMBlock(nn.Module):
+class CBAMBlock(nn.Module):
     """
-    CRAM (Channel and Spatial Attention) Block
+    CBAM (Convolutional Block Attention Module) Block
     """
 
     def __init__(self, channels):
@@ -189,13 +189,13 @@ class YOLOD11Neck(nn.Module):
     def __init__(self):
         super().__init__()
         # Small object branch (high resolution)
-        self.cram_small = CRAMBlock(256)
+        self.cbam_small = CBAMBlock(256)
 
         # Medium object branch (medium resolution)
-        self.cram_medium = CRAMBlock(512)
+        self.cbam_medium = CBAMBlock(512)
 
         # Large object branch (low resolution)
-        self.cram_large = CRAMBlock(1024)
+        self.cbam_large = CBAMBlock(1024)
         self.spp = SPPModule(1024, 1024)
 
         # Top-down path (large to small)
@@ -222,10 +222,10 @@ class YOLOD11Neck(nn.Module):
     def forward(self, features):
         c3, c4, c5 = features
 
-        # Apply CRAM blocks and SPP to each feature level
-        p3 = self.cram_small(c3)
-        p4 = self.cram_medium(c4)
-        p5 = self.cram_large(c5)
+        # Apply CBAM blocks and SPP to each feature level
+        p3 = self.cbam_small(c3)
+        p4 = self.cbam_medium(c4)
+        p5 = self.cbam_large(c5)
         p5 = self.spp(p5)
 
         # Top-down path
