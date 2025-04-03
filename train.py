@@ -48,7 +48,24 @@ def validate(model, dataloader, device, config, class_names=None):
     with torch.no_grad():
         for batch_i, (imgs, targets, paths) in enumerate(pbar):
             imgs = imgs.to(device, non_blocking=True)
-
+            
+            # Debug print the targets
+            print(f"\nValidation batch {batch_i}:")
+            print(f"  - Images shape: {imgs.shape}")
+            print(f"  - Targets shape: {targets.shape if isinstance(targets, torch.Tensor) else 'list'}")
+            print(f"  - Num targets: {len(targets)}")
+            if len(targets) > 0:
+                # Print number of valid targets (with class > 0)
+                valid_targets = targets[targets[:, 1] > 0] if isinstance(targets, torch.Tensor) else []
+                print(f"  - Valid targets: {len(valid_targets)}")
+                if len(valid_targets) > 0:
+                    print(f"  - Sample targets: {valid_targets[:2]}")
+            
+            # Save targets for metric calculation
+            if targets is not None and len(targets) > 0:
+                logger.debug(f"Batch {batch_i}: targets shape {targets.shape}")
+                all_targets.append(targets.clone().cpu())
+            
             # Run model
             try:
                 outputs = model(imgs)
@@ -78,14 +95,24 @@ def validate(model, dataloader, device, config, class_names=None):
 
                 # Apply NMS
                 detections = non_max_suppression(predictions, conf_thres=0.1, iou_thres=0.5)
+                
+                # Log the number of detections
+                num_detections = sum(len(d) if d is not None else 0 for d in detections)
+                logger.debug(f"Batch {batch_i}: {num_detections} detections after NMS")
+                print(f"  - Total detections after NMS: {num_detections}")
+                if num_detections > 0:
+                    for i, det in enumerate(detections):
+                        if det is not None and len(det) > 0:
+                            print(f"    - Image {i}: {len(det)} detections")
+                            if i == 0:  # Print first few detections of first image
+                                print(f"    - First detection: {det[0]}")
+                
                 all_predictions.extend(detections)
             except Exception as e:
                 logger.error(f"Error in validation forward pass: {e}")
+                print(f"  - ERROR in validation forward pass: {e}")
                 # Return dummy metrics
                 return {'precision': 0, 'recall': 0, 'mAP': 0}
-
-            # Save targets for metric calculation
-            all_targets.append(targets)
 
             # For visualization, process only the first batch
             if batch_i == 0:
@@ -95,14 +122,30 @@ def validate(model, dataloader, device, config, class_names=None):
                         fig = visualize_detections(imgs[i], detections[i], class_names)
                         plt.close(fig)
 
+    # Check if we collected any targets
+    if len(all_targets) == 0:
+        logger.warning("No targets collected during validation")
+        print("No targets collected during validation")
+        return {'precision': 0, 'recall': 0, 'mAP': 0}
+        
     # Concatenate all targets
-    all_targets = torch.cat(all_targets, 0) if all_targets else torch.zeros((0, 6))
+    try:
+        all_targets = torch.cat(all_targets, 0)
+        logger.info(f"Collected {len(all_targets)} targets for validation")
+        print(f"Collected {len(all_targets)} targets for validation")
+        print(f"Target classes: {all_targets[:, 1].unique().tolist()}")
+        print(f"Class distribution: {[(c.item(), (all_targets[:, 1] == c).sum().item()) for c in all_targets[:, 1].unique()]}")
+    except Exception as e:
+        logger.error(f"Error concatenating targets: {e}")
+        print(f"Error concatenating targets: {e}")
+        return {'precision': 0, 'recall': 0, 'mAP': 0}
 
     # Compute validation metrics
     try:
         metrics = calculate_metrics(all_predictions, all_targets, iou_thres=0.5)
     except Exception as e:
         logger.error(f"Error calculating metrics: {e}")
+        print(f"Error calculating metrics: {e}")
         metrics = {'precision': 0, 'recall': 0, 'mAP': 0}
 
     return metrics

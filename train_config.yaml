@@ -10,11 +10,11 @@ anchors:
 strides: [8, 16, 32]
 
 # Dataset configuration
-data_yaml: 'data/coco.yaml'
+data_yaml: 'dataset/data.yaml'
 
 # Training parameters
 batch_size: 16
-epochs: 300
+epochs: 10
 workers: 8
 lr: 0.01
 weight_decay: 0.0005
